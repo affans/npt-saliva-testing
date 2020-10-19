@@ -148,4 +148,3 @@ run_sims()
 # mean(totals_filtered)
 # histogram(mean(results[:, 1:150], dims=1)')
 
-
