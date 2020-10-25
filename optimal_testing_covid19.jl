@@ -8,6 +8,8 @@ using Distributions
 using OffsetArrays
 using Optim
 using Gnuplot
+using DelimitedFiles
+using Parameters
 Gnuplot.options.verbose=false
 pwd()
 println(Gnuplot.gpversion())
@@ -62,12 +64,36 @@ function gompertz(shift_value, tvals)
 end
 
 @inline function infect_start()
+    # returns the start of infectiousness period BEFORE SYMPTOM ONSET 
+    # so the interpretation here is a 'negative number' 
     lat_dist = truncated(LogNormal(1.434065, 0.6612), 3, 15)
     inc_period = Int.(round.(rand(lat_dist)))
     return inc_period .- 1 #infectiousness starts one day after incubation
 end
 
+
+function fitted_curves()
+    sens = get_sensitivity_data()
+    ymeans_offset = get_nature_curve(-15:40)
+    # define function to the minimized
+    f_min(p, ngmp) = sum((sens[0:25] .- p[3].*ymeans_offset[0:25].^p[1] ./ (ymeans_offset[0:25].^p[1] .+ p[2]) .* ngmp[0:25]).^2)
+    @. f(x, p, ngmp) = (p[3]*x^p[1]  / (x^p[1] + p[2])) *  ngmp
+    dd = Dict{Int64, OffsetArray{Float64,1,Array{Float64,1}}}()
+    for inf = 2:14 # since infectiousness can only start between 2 to 14 days (see `infect_start`) 
+        ngmp = gompertz(inf, -15:40)     ## values must match TVAL_OFFSET
+        optz = optimize(p -> f_min(p, ngmp), [1, 0.5, 0.5]; autodiff = :forward)
+        p0 = Optim.minimizer(optz)
+        #println(typeof(f(ymeans_offset, p0, ngmp)))
+        #println(p0)
+        dd[inf] = f(ymeans_offset, p0, ngmp)
+    end
+    return dd
+end
+
 function get_sensitivity(inf_start)
+    ## this function not used anymore. 
+    ## this was flawed as we were fitting everytime inf_start was sampled
+    ## since there are only 14 curves, we don't need to sample 10000 times for the same fits
     sens = get_sensitivity_data()
     ngmp = gompertz(inf_start, -15:40)     ## values must match TVAL_OFFSET
     ymeans_offset = get_nature_curve(-15:40)   
@@ -79,7 +105,7 @@ function get_sensitivity(inf_start)
     optz = optimize(f_min, [1, 0.5, 0.5]; autodiff = :forward)
     p0 = Optim.minimizer(optz)
     #p0 = [0.5, 0.5, 0.5]
-    #println(p0)
+    println(p0)
     myhill = f(ymeans_offset, p0)
     return myhill
 end
@@ -102,63 +128,136 @@ function plot_sensitivity(inf_start)
     @gp :- 0:25 get_sensitivity_data()[0:25] "with points title 'sensitivity' pt 7 pointsize 0.65 lc rgb 'orange'"
 end
 
-function next_tests_probs(test_type=:np, inf_type=:all, testfreq = 7, exp_days = 30)
-    #test_type=:np; inf_type=:all; testfreq = 5; exp_days = 20
-    dayoftest = collect(testfreq:testfreq:exp_days)
-    days_positive = zeros(Float64, exp_days)   
+@with_kw mutable struct ModelParams
+    test_type::Symbol = :np
+    inf_type::Symbol = :all
+    testfreq::Int16 = 7
+    exp_days::Int32 = 100
+end
 
-    for t = 1:exp_days
-        inf_start = infect_start()
-        sensitivity = get_sensitivity(inf_start)
-        maxvalue =  maximum(sensitivity)
+function nn(mp::ModelParams, sens_curves)
+    @unpack test_type, inf_type, testfreq, exp_days = mp
+    dayoftest = collect(testfreq:testfreq:exp_days)
+    positivity_alltests = zeros(Float64, exp_days)   # vectors to store the results
+    positivity_firsttest = zeros(Float64, exp_days)
+    for t = 1:exp_days 
+        inf_start = infect_start() # need a negative here for proper indexing
+        sensitivity = sens_curves[inf_start] # get the fitted sensitivity curve for this infectiousness period 
+        maxvalue =  maximum(sensitivity) # get the maximum value for normalizing purpose
         if test_type == :sal 
             sensitivity .= sensitivity ./ maxvalue # for saliva, normalize the curve.
         end
-        
-        total_infect_days = length(sensitivity) ## get the total infectiousness period 
-        possible_tests = filter(x -> x > t && x < total_infect_days + t , dayoftest)
-
-        # get the relative_infectivity index for the offset array
-        rel_idx = -15 .+ (possible_tests .- t)
+        test_over_days = length(-inf_start:15) # only 15 days post symptom onset        
+        possible_tests = filter(x -> x > t && x < test_over_days + t , dayoftest)
+        rel_idx = -inf_start .+ (possible_tests .- t)
         if inf_type == :pre
             rel_idx = filter(x -> x < 0, rel_idx)
         end
 
-         # see what happens on the day of the test and record that for t. 
+        # positivity first test only
+        # ft_idx = rel_idx[1] # get the index of the first test
+        # infect = sensitivity[ft_idx]
+        # if test_type == :sal 
+        #     infect = infect * rand(Uniform(0.70, 0.97))
+        # end
+        # positivity_firsttest[t] = infect
+        
+        # positivity all tests
         tot_fails = map(rel_idx) do x 
-            infect = sensitivity[x]
+            infect = sensitivity[x] 
             if test_type == :sal 
                 infect = infect * rand(Uniform(0.70, 0.97)) # saliva is done based on a normalized curve of np 
             end
             failure = 1 - infect
         end
-        any_l = length(tot_fails)
+        any_l = length(tot_fails) # don't really need this check anymore since length(possible_tests) > 0 in this if branch
         prob_success = any_l > 0.0 ? 1 - reduce(*, tot_fails) : 0.0
-        days_positive[t] = prob_success
+        positivity_alltests[t] = prob_success
     end
-    return days_positive    
+    return (alltests = positivity_alltests, firsttest = positivity_firsttest)
+end
+
+function next_tests_probs(test_type, inf_type, testfreq, exp_days, sens_curves)
+    # deprecated
+    dayoftest = collect(testfreq:testfreq:exp_days)
+    positivity_alltests = zeros(Float64, exp_days)   # vectors to store the results
+    positivity_firsttest = zeros(Float64, exp_days)
+    for t = 1:exp_days
+        inf_start = infect_start() # sample the start of infectiousness period
+        sensitivity = sens_curves[inf_start] # get the fitted sensitivity curve for this infectiousness period 
+        maxvalue =  maximum(sensitivity) # get the maximum value for normalizing purpose
+        if test_type == :sal 
+            sensitivity .= sensitivity ./ maxvalue # for saliva, normalize the curve.
+        end
+        
+        # this variable says how many total days of the infectiousness curve is the testing happening
+        test_over_days = length(-15:15) # only 15 days post symptom onset
+        possible_tests = filter(x -> x > t && x < test_over_days + t , dayoftest)
+       
+        if length(possible_tests) > 0 
+            # get the relative_infectivity index for the offset array
+            rel_idx = -15 .+ (possible_tests .- t)
+            if inf_type == :pre
+                rel_idx = filter(x -> x < 0, rel_idx)
+            end
+
+            # positivity first test only
+            ft_idx = rel_idx[1] # get the index of the first test
+            infect = sensitivity[ft_idx]
+            if test_type == :sal 
+                infect = infect * rand(Uniform(0.70, 0.97))
+            end
+            positivity_firsttest[t] = infect
+            println("t: $t, test dates: $(possible_tests)")
+            println("inf start: $(inf_start), $(rel_idx), ft_idx: $(ft_idx)\n")
+            println("infect: $infect")
+
+            # positivity all tests
+            tot_fails = map(rel_idx) do x 
+                infect = sensitivity[x] 
+                if test_type == :sal 
+                    infect = infect * rand(Uniform(0.70, 0.97)) # saliva is done based on a normalized curve of np 
+                end
+                failure = 1 - infect
+            end
+            any_l = length(tot_fails) # don't really need this check anymore since length(possible_tests) > 0 in this if branch
+            prob_success = any_l > 0.0 ? 1 - reduce(*, tot_fails) : 0.0
+            positivity_alltests[t] = prob_success
+        end
+    end
+    return (alltests = positivity_alltests, firsttest = positivity_firsttest)
 end
 
 function run_sims()
-    println("starting simulations...")
+    println("starting simulations (sens already fitted)...")
     println("using threads: $(Threads.nthreads())")
-    N = 10
-    experiment_days = 20 
-    freq = (7, 14 )
-    st = (:np, :sal)
-    tg = (:all, :pre)    
-    for (t, g, f) in Iterators.product(st, tg, freq)
-        fname = ("/data/optimal_testing/$(t)_$(f)days_$(g).csv")
-        println(fname)  
-        freq_of_test = f       
-        results = zeros(Float64, experiment_days, N)
+    N = 50000
+    experiment_days = 31 
+    sens_curves = fitted_curves()
+    mp = ModelParams()
+    freq = (16, 17, 18, 19, 20, 25, 26, 27, 28, 29, 30 )
+    st = (:np, )
+    tg = (:all, )    
+    for (t, g, f) in Iterators.product(st, tg, freq)        
+        mp.exp_days = experiment_days
+        mp.testfreq = f
+        mp.test_type = t 
+        mp.inf_type = g
+           
+        results_alltests = zeros(Float64, experiment_days, N)
+        results_firsttests = zeros(Float64, experiment_days, N)
+        
         Threads.@threads for i = 1:N
-            results[:, i] = next_tests_probs(t, g, freq_of_test, experiment_days)
+            res = nn(mp, sens_curves)
+            results_alltests[:, i] = res.alltests
+            results_firsttests[:, i] = res.firsttest
         end
-        # totals = sum(results, dims=2)./N
-        # # plot(totals, seriestype=:bar)
-        # # mean(totals)
-        #writedlm(fname, results)
+        totals = mean(results_alltests, dims=2)
+        println("$(f)days_$(g) mean: $(mean(totals))")
+        #dirpath = 
+        #isdir(dir) || mkdir(dir)
+        writedlm("/data/optimal_testing/firsttest/$(t)_$(f)days_$(g)_alltests.csv", results_alltests)
+        writedlm("/data/optimal_testing/firsttest/$(t)_$(f)days_$(g)_firsttests.csv", results_firsttests)
     end
 end
 
