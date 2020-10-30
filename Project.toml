@@ -1,0 +1,12 @@
+[deps]
+CSV = "336ed68f-0bac-5ca0-87d4-7b16caf5d00b"
+DataFrames = "a93c6f00-e57d-5684-b7b6-d8193f3e46c0"
+DelimitedFiles = "8bb1440f-4735-579b-a4ab-409b98df4dab"
+Distributions = "31c24e10-a181-5473-b8eb-7969acd0382f"
+GLPK = "60bf3e95-4087-53dc-ae20-288a0d20c6a6"
+Gnuplot = "dc211083-a33a-5b79-959f-2ff34033469d"
+LsqFit = "2fda8390-95c7-5789-9bda-21331edee243"
+OffsetArrays = "6fe1bfb0-de20-5000-8ca7-80f57d26f881"
+Optim = "429524aa-4258-5aef-a3af-852621145aeb"
+Parameters = "d96e819e-fc66-5662-9728-84c9c7592b0a"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"

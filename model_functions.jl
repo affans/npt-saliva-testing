@@ -1,5 +1,12 @@
 ## npt-saliva-testing
-#using JuMP, Ipopt
+## Affan Shoukat, 2020 
+## Center for Infectious Disease Modelling and Analysis 
+
+# activate the folder environment to pull in the correct versions of the packages used
+using Pkg
+Pkg.activate(".")
+Pkg.status()
+
 using GLPK
 using DataFrames 
 using CSV 
@@ -15,42 +22,52 @@ Gnuplot.options.verbose=false
 pwd()
 #println(Gnuplot.gpversion())
 
+
+# read global data files 
 const ll = CSV.File("data/likelihoods.csv") |> DataFrame! ; 
+const TVAL_OFFSET = -15:40 # run time for the infection
+
+# first column is digitized from https://www.ncbi.nlm.nih.gov/pmc/articles/PMC7151472/
+# second column is digitized from https://faseb.onlinelibrary.wiley.com/doi/10.1096/fj.202001700RR
 const sens_csv = CSV.File("data/sensitivity.csv", header=true) |> DataFrame! ;
-const TVAL_OFFSET = -15:40 # run time for the infection.
+
+@with_kw mutable struct ModelParams
+    test_type::Symbol = :np
+    inf_type::Symbol = :all
+    firsttest::Int16 = 50
+    testfreq::Int16 = 7
+    exp_days::Int32 = 100
+end
 
 ## read the likelihood file from the Ashcroft paper. 
 function get_infectivity_curve(t, shape, rate, shift)
     dist = Gamma(shape, 1/rate)    
     pdfvals = pdf.(dist, t .+ shift) 
 end
-
-# we don't really use ashcroft 
+ 
 function sample_ashcroft()
-    # return shape, rate, shift from ashcroft's likelihood
+    # return shape, rate, shift from ashcroft likelihood table
     N = nrow(ll)
     rr = rand(1:N)  
     shape, rate, shift = ll[rr, :].shape, ll[rr, :].rate, ll[rr, :].shift 
 end
 
 function get_ashcroft_curve(tvals)    
-    #tvals = -15:25 ## 25 since the harvard sensitivity data only has 26 points
     randcurves = hcat([get_infectivity_curve(tvals, sample_ashcroft()...) for _=1:1000]...)
     ymeans_ashcroft = dropdims(mean(randcurves, dims=2), dims=2) 
     ylows_ashcroft = quantile.(eachrow(randcurves), [0.025])
     yhighs_ashcroft = quantile.(eachrow(randcurves), [0.975])
-    return ymeans_ashcroft, ylows_ashcroft, yhighs_ashcroft
+    return OffsetArray(ymeans_ashcroft, tvals), OffsetArray(ylows_ashcroft, tvals), OffsetArray(yhighs_ashcroft, tvals)
 end
 
 function get_nature_curve(tvals)
-    #tvals = -15:25 ## 25 since the harvard sensitivity data only has 26 points
-    shrash =  20.516508, 1.592124, 12.272481    # nature.
+    shrash =  20.516508, 1.592124, 12.272481    # parameters from the corrected nature paper
     ymeans_nature = get_infectivity_curve(tvals, shrash...) 
     ymeans_offset = OffsetArray(ymeans_nature, tvals)
 end
 
 function get_sensitivity_data()
-    # loads the sensitivity data from the const DataFrame
+    # loads the sensitivity data from the const loaded DataFrame
     sens::Array{Float64, 1}  = Int64.(sens_csv.harvard[1:26])./100  # harvard data includes day 0 as symptom onset + 25 days of post symptoms
     sens_off = OffsetArray(sens, 0:25) # offset the array for easier indexing in fitting process. has nothing to do with TVAL_OFFSET
     return sens_off
@@ -74,6 +91,8 @@ end
 
 
 function fitted_curves()
+    # this gives us the sensitivity curves for NP tests
+    # returns 13 sensitivity curves, one for each value of the incubation period from 2 to 13. 
     sens = get_sensitivity_data()
     ymeans_offset = get_nature_curve(-15:40)
     # define function to the minimized
@@ -111,35 +130,9 @@ function get_sensitivity(inf_start)
     return myhill
 end
 
-function plot_sensitivity(inf_start)
-    myhill = get_sensitivity(4) # plot sensitivity curve with infectiouness starting at i days
-    println("maximum: $(maximum(myhill))")
-        
-    saliva_curves = hcat([rand(Uniform(0.70, 0.97)) * myhill / maximum(myhill) for _ = 1:1000]...)
-    saliva_mean = dropdims(mean(saliva_curves, dims=2), dims=2)
-    slows = quantile.(eachrow(saliva_curves), [0.025])
-    shighs = quantile.(eachrow(saliva_curves), [0.975])
-    
-    @gp "set term svg enhanced standalone mouse size 800,400" ## use jupyter
-    @gp :- tit="Fitted Hill Curve" key="opaque" 
-    #@gp :- TVAL_OFFSET ymeans_offset[TVAL_OFFSET] "with lines title 'rel infectivity'"
-    @gp :- TVAL_OFFSET slows shighs "with filledcu title 'quantile' lw 2 lc rgb '#a1d99b' "
-    @gp :- TVAL_OFFSET saliva_mean "with lines title 'saliva mean' lc rgb 'black' lw 3"
-    @gp :- TVAL_OFFSET myhill[TVAL_OFFSET] "with boxes title 'npt' lc rgb 'blue'"
-    @gp :- 0:25 get_sensitivity_data()[0:25] "with points title 'sensitivity' pt 7 pointsize 0.65 lc rgb 'orange'"
-end
-
-@with_kw mutable struct ModelParams
-    test_type::Symbol = :np
-    inf_type::Symbol = :all
-    firsttest::Int16 = 50
-    testfreq::Int16 = 7
-    exp_days::Int32 = 100
-end
-
-
-function nn(mp::ModelParams, sens_curves)
+function run_scenario(mp::ModelParams, sens_curves)
     @unpack test_type, inf_type, firsttest, testfreq, exp_days = mp
+    #println(mp)
     dayoftest = collect(firsttest:testfreq:exp_days)
     positivity_alltests = zeros(Float64, exp_days)   # vectors to store the results
     positivity_firsttest = zeros(Float64, exp_days) 
@@ -170,8 +163,7 @@ function nn(mp::ModelParams, sens_curves)
 
         any_l = length(test_sens) # don't really need this check anymore since length(possible_tests) > 0 in this if branch
         if any_l > 0 
-            positivity_firsttest[t] = test_sens[1] # just get the first one for now.   
-            #positivity_sectest[t] = test_sens[2]     
+            positivity_firsttest[t] = test_sens[1] # just get the first one for now.       
             tot_fails = 1 .- test_sens            
             prob_success = any_l > 0.0 ? 1 - reduce(*, tot_fails) : 0.0
             positivity_alltests[t] = prob_success
@@ -180,8 +172,9 @@ function nn(mp::ModelParams, sens_curves)
     return (alltests = positivity_alltests, firsttest = positivity_firsttest)
 end
 
+
 function run_sims()
-    Random.seed!(2746)
+    #Random.seed!(2746)
     println("starting simulations (sens already fitted)...")
     println("using threads: $(Threads.nthreads())")
     N = 10000 
@@ -203,7 +196,7 @@ function run_sims()
         results_firsttests = zeros(Float64, experiment_days, N)
         
         Threads.@threads for i = 1:N
-            res = nn(mp, sens_curves)
+            res = run_scenario(mp, sens_curves)
             results_alltests[:, i] = res.alltests
             results_firsttests[:, i] = res.firsttest
         end
